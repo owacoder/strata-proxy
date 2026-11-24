@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""b580-proxy - nginx + Let's Encrypt helper for the B580 AI services.
+
+This is the privileged helper (installed as /usr/local/libexec/b580-proxy).
+It is driven by the B580-ai control panel or by the user-facing
+/usr/local/bin/b580-proxy wrapper.  It only ever writes its own files under
+/etc/b580-proxy, /etc/nginx/b580-proxy and /etc/nginx/sites-available.
+
+Two public HTTPS ports are exposed:
+
+    primary port   -> http://127.0.0.1:8080
+    secondary port -> http://127.0.0.1:8081
+
+Every request (except the ACME HTTP-01 challenge) must carry the API key,
+either as ``X-API-Key: <key>`` or ``Authorization: Bearer <key>``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+CONF_DIR = Path("/etc/b580-proxy")
+SETTINGS_PATH = CONF_DIR / "settings.json"
+KEYS_PATH = CONF_DIR / "api-keys.json"
+KEY_PATH = CONF_DIR / "api.key"  # legacy single-key file, mirrored for rollback
+LAST_ERROR_PATH = CONF_DIR / "last-error"
+
+NGINX_CONF_DIR = Path("/etc/nginx/b580-proxy")
+KEY_CONF_PATH = NGINX_CONF_DIR / "api-key.conf"  # primary server
+KEY_CONF_SECONDARY = NGINX_CONF_DIR / "api-key-secondary.conf"
+SITE_PATH = Path("/etc/nginx/sites-available/b580-proxy.conf")
+SITE_LINK = Path("/etc/nginx/sites-enabled/b580-proxy.conf")
+WEBROOT = Path("/var/www/b580-proxy")
+LIVE_DIR = Path("/etc/letsencrypt/live")
+DEPLOY_HOOK = Path("/etc/letsencrypt/renewal-hooks/deploy/b580-proxy-reload")
+
+BACKEND_PRIMARY = 8080
+BACKEND_SECONDARY = 8081
+SLOTS = ("primary", "secondary")
+
+DEFAULT_SETTINGS = {
+    "enabled": False,
+    "domain": "",
+    "domain2": "",
+    "port": 443,
+    "port2": 8443,
+    "email": "",
+    "staging": False,
+}
+
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+KEY_RE = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
+
+
+class ProxyError(Exception):
+    def __init__(self, message: str, detail: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".b580-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def run(cmd: list[str], input_text: str | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise ProxyError(f"missing command: {cmd[0]}", str(exc))
+    except subprocess.TimeoutExpired as exc:
+        raise ProxyError(f"command timed out: {' '.join(cmd)}", str(exc))
+
+
+def normalise_domain(value: object) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    text = text.split("/", 1)[0]
+    text = text.split(":", 1)[0].strip(".")
+    return text
+
+
+def validate_settings(data: dict) -> dict:
+    out = dict(DEFAULT_SETTINGS)
+    out.update({k: data[k] for k in DEFAULT_SETTINGS if k in data})
+
+    out["domain"] = normalise_domain(out.get("domain"))
+    out["domain2"] = normalise_domain(out.get("domain2"))
+    out["email"] = str(out.get("email") or "").strip()
+    out["staging"] = bool(out.get("staging"))
+    out["enabled"] = bool(out.get("enabled"))
+
+    if not out["domain"]:
+        raise ProxyError("a primary domain is required")
+    for label, domain in (("primary", out["domain"]), ("second", out["domain2"])):
+        if domain and not DOMAIN_RE.match(domain):
+            raise ProxyError(f"{label} domain is not a valid DNS name: {domain!r}")
+    if out["domain2"] == out["domain"]:
+        out["domain2"] = ""
+    if out["email"] and not EMAIL_RE.match(out["email"]):
+        raise ProxyError(f"email address is not valid: {out['email']!r}")
+
+    try:
+        out["port"] = int(out["port"])
+        out["port2"] = int(out["port2"])
+    except (TypeError, ValueError):
+        raise ProxyError("ports must be whole numbers")
+    for label, port in (("primary", out["port"]), ("second", out["port2"])):
+        if not (1 <= port <= 65535):
+            raise ProxyError(f"{label} port must be between 1 and 65535")
+        if port == 80:
+            raise ProxyError("port 80 is reserved for the ACME challenge")
+    if out["port"] == out["port2"]:
+        raise ProxyError("the two public ports must be different")
+    return out
+
+
+def read_settings() -> dict:
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            data.update(raw)
+    except (OSError, ValueError):
+        pass
+    return data
+
+
+def write_settings(data: dict) -> None:
+    atomic_write(SETTINGS_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", 0o600)
+
+
+def domains_of(settings: dict) -> list[str]:
+    out = [settings["domain"]]
+    if settings.get("domain2"):
+        out.append(settings["domain2"])
+    return out
+
+
+def cert_name(settings: dict) -> str:
+    return "b580-proxy-staging" if settings.get("staging") else "b580-proxy"
+
+
+def cert_dir(settings: dict) -> Path:
+    return LIVE_DIR / cert_name(settings)
+
+
+def generate_key() -> str:
+    return secrets.token_hex(24)
+
+
+def read_key() -> str:
+    """Read the legacy single-key file (used when migrating to two slots)."""
+    try:
+        return KEY_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def key_hint(key: str) -> str:
+    return ("••••" + key[-4:]) if key else ""
+
+
+def key_fingerprint(key: str) -> str:
+    if not key:
+        return ""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def key_info(key: str) -> dict:
+    return {
+        "set": bool(key),
+        "hint": key_hint(key),
+        "fingerprint": key_fingerprint(key),
+    }
+
+
+def check_slot(slot: str) -> str:
+    slot = str(slot or "primary").strip().lower()
+    if slot not in SLOTS:
+        raise ProxyError(f"unknown API key slot: {slot!r}", "use primary or secondary")
+    return slot
+
+
+def read_keys() -> dict:
+    """Load both keys, migrating a legacy single key to both slots if needed.
+
+    Existing installs keep working: the old key is copied to the primary slot
+    and to the secondary slot.  A fresh install with no key generates nothing
+    here; ensure_keys() does that when the proxy is first enabled.
+    """
+    keys = {slot: "" for slot in SLOTS}
+    changed = False
+    try:
+        raw = json.loads(KEYS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for slot in SLOTS:
+                value = str(raw.get(slot) or "").strip()
+                if KEY_RE.match(value):
+                    keys[slot] = value
+                elif value:
+                    changed = True
+    except FileNotFoundError:
+        changed = True
+    except (OSError, ValueError):
+        changed = True
+
+    legacy = read_key()
+    if not keys["primary"] and not keys["secondary"] and KEY_RE.match(legacy):
+        keys = {"primary": legacy, "secondary": legacy}
+        changed = True
+    if not keys["primary"] and keys["secondary"]:
+        keys["primary"] = keys["secondary"]
+        changed = True
+    if not keys["secondary"] and keys["primary"]:
+        keys["secondary"] = keys["primary"]
+        changed = True
+
+    if changed and keys["primary"] and keys["secondary"]:
+        write_keys(keys)
+    return keys
+
+
+def ensure_keys() -> tuple[dict, dict]:
+    """Return both keys, generating any missing ones.  Generated keys are returned once."""
+    keys = read_keys()
+    generated: dict[str, str] = {}
+    for slot in SLOTS:
+        if not keys[slot]:
+            keys[slot] = generate_key()
+            generated[slot] = keys[slot]
+    if generated:
+        write_keys(keys)
+    return keys, generated
+
+
+def write_keys(keys: dict) -> None:
+    for slot in SLOTS:
+        if not KEY_RE.match(str(keys.get(slot) or "")):
+            raise ProxyError(
+                f"{slot} API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen"
+            )
+    atomic_write(
+        KEYS_PATH,
+        json.dumps({slot: keys[slot] for slot in SLOTS}, indent=2) + "\n",
+        0o600,
+    )
+    # Keep the legacy file in sync with the primary key for easy rollback.
+    atomic_write(KEY_PATH, keys["primary"] + "\n", 0o600)
+    write_key_conf(keys["primary"], KEY_CONF_PATH)
+    write_key_conf(keys["secondary"], KEY_CONF_SECONDARY)
+
+
+def write_key_conf(key: str, path: Path) -> None:
+    # This file is included inside one HTTPS server block.  Exact string
+    # comparisons avoid long nginx map keys; a 48-character generated key in a
+    # map regex exceeded nginx's default map_hash_bucket_size (64).
+    conf = f"""# Generated by b580-proxy - do not edit.
+# Included inside one HTTPS server block.
+# A request needs either X-API-Key: <key> or Authorization: Bearer <key>.
+set $b580_bearer_token "";
+if ($http_authorization ~* "^Bearer[[:space:]]+([A-Za-z0-9._~-]+)$") {{
+    set $b580_bearer_token $1;
+}}
+
+set $b580_key_ok 0;
+if ($http_x_api_key = "{key}") {{
+    set $b580_key_ok 1;
+}}
+if ($b580_bearer_token = "{key}") {{
+    set $b580_key_ok 1;
+}}
+"""
+    atomic_write(path, conf, 0o600)
+
+
+def cert_state(settings: dict) -> dict:
+    directory = cert_dir(settings)
+    fullchain = directory / "fullchain.pem"
+    privkey = directory / "privkey.pem"
+    state = {
+        "present": fullchain.is_file() and privkey.is_file(),
+        "path": str(fullchain),
+        "cert_name": cert_name(settings),
+        "staging": bool(settings.get("staging")),
+        "expires": None,
+        "days_left": None,
+        "domains": [],
+    }
+    if not state["present"]:
+        return state
+    try:
+        proc = run(
+            ["openssl", "x509", "-in", str(fullchain), "-noout", "-enddate", "-ext", "subjectAltName"],
+            timeout=10,
+        )
+    except ProxyError:
+        return state
+    if proc.returncode != 0:
+        return state
+    text = proc.stdout
+    match = re.search(r"notAfter=(.+)", text)
+    if match:
+        try:
+            expires = parsedate_to_datetime(match.group(1).strip()).astimezone(timezone.utc)
+            state["expires"] = expires.isoformat()
+            state["days_left"] = round((expires - now()).total_seconds() / 86400, 1)
+        except (TypeError, ValueError):
+            pass
+    for domain in re.findall(r"DNS:([^\s,]+)", text):
+        if domain not in state["domains"]:
+            state["domains"].append(domain)
+    return state
+
+
+def cert_matches(cert: dict, settings: dict) -> bool:
+    wanted = set(domains_of(settings))
+    have = set(cert.get("domains") or [])
+    return bool(wanted) and wanted.issubset(have)
+
+
+def nginx_active() -> bool:
+    proc = run(["systemctl", "is-active", "--quiet", "nginx"], timeout=10)
+    return proc.returncode == 0
+
+
+def nginx_test() -> tuple[bool, str]:
+    proc = run(["nginx", "-t"], timeout=30)
+    text = (proc.stderr or proc.stdout or "").strip()
+    return proc.returncode == 0, text
+
+
+def nginx_start_or_reload() -> None:
+    if nginx_active():
+        proc = run(["systemctl", "reload", "nginx"], timeout=30)
+    else:
+        run(["systemctl", "enable", "nginx"], timeout=30)
+        proc = run(["systemctl", "start", "nginx"], timeout=60)
+    if proc.returncode != 0:
+        raise ProxyError("could not start or reload nginx", (proc.stderr or proc.stdout).strip())
+
+
+def site_enabled() -> bool:
+    return SITE_LINK.is_symlink() or SITE_LINK.exists()
+
+
+def map_https_port(settings: dict) -> str:
+    lines = [f"    default {settings['port']};"]
+    if settings.get("domain2"):
+        lines.append(f'    "{settings["domain2"]}" {settings["port2"]};')
+    return "\n".join(lines)
+
+
+def http_server(settings: dict, tls_ready: bool) -> str:
+    domains = " ".join(domains_of(settings))
+    if tls_ready:
+        fallback = (
+            '    location / {\n'
+            '        return 301 https://$host:$b580_https_port$request_uri;\n'
+            '    }\n'
+        )
+    else:
+        fallback = (
+            '    location / {\n'
+            '        default_type text/plain;\n'
+            '        return 503 "b580-proxy: the TLS certificate is not ready yet.\\n";\n'
+            '    }\n'
+        )
+    return f"""server {{
+    listen 80;
+    listen [::]:80;
+    server_name {domains};
+
+    location ^~ /.well-known/acme-challenge/ {{
+        root {WEBROOT};
+        default_type text/plain;
+    }}
+
+{fallback}    access_log /var/log/nginx/b580-proxy.access.log;
+    error_log /var/log/nginx/b580-proxy.error.log warn;
+}}
+"""
+
+
+def https_server(
+    settings: dict,
+    domain: str,
+    port: int,
+    backend: int,
+    label: str,
+    cert: dict,
+    key_conf: Path,
+) -> str:
+    directory = cert_dir(settings)
+    return f"""server {{
+    listen {port} ssl;
+    listen [::]:{port} ssl;
+    http2 on;
+    server_name {domain};
+
+    include {key_conf};
+
+    server_tokens off;
+    ssl_certificate {directory / 'fullchain.pem'};
+    ssl_certificate_key {directory / 'privkey.pem'};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:b580_{label}:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    error_page 401 = @b580_unauthorized;
+
+    access_log /var/log/nginx/b580-proxy.access.log;
+    error_log /var/log/nginx/b580-proxy.error.log warn;
+
+    client_max_body_size 256m;
+    client_body_timeout 3600s;
+    send_timeout 3600s;
+
+    location @b580_unauthorized {{
+        default_type application/json;
+        add_header WWW-Authenticate 'Bearer realm="b580-proxy"' always;
+        return 401 '{{"ok":false,"error":"API key required"}}';
+    }}
+
+    location / {{
+        if ($b580_key_ok = 0) {{
+            return 401;
+        }}
+        proxy_pass http://127.0.0.1:{backend};
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header X-Forwarded-Port $server_port;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $b580_connection_upgrade;
+        # The proxy key is for nginx only; do not leak it to Strata.
+        proxy_set_header Authorization "";
+        proxy_set_header X-API-Key "";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 15s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+}}
+"""
+
+
+def render_site(settings: dict, cert: dict, tls_ready: bool) -> str:
+    parts = [
+        "# Generated by b580-proxy - edit the panel or run b580-proxy apply.\n",
+        f"# Public: {', '.join(domains_of(settings))} -> 127.0.0.1:{BACKEND_PRIMARY}/{BACKEND_SECONDARY}\n\n",
+        "map $http_upgrade $b580_connection_upgrade {\n"
+        "    default upgrade;\n"
+        "    ''      close;\n"
+        "}\n\n",
+        "map $host $b580_https_port {\n",
+        map_https_port(settings),
+        "\n}\n\n",
+        http_server(settings, tls_ready),
+    ]
+    if tls_ready:
+        parts.append(
+            https_server(
+                settings,
+                settings["domain"],
+                settings["port"],
+                BACKEND_PRIMARY,
+                "one",
+                cert,
+                KEY_CONF_PATH,
+            )
+        )
+        parts.append(
+            https_server(
+                settings,
+                settings.get("domain2") or settings["domain"],
+                settings["port2"],
+                BACKEND_SECONDARY,
+                "two",
+                cert,
+                KEY_CONF_SECONDARY,
+            )
+        )
+    return "".join(parts)
+
+
+def install_site(content: str) -> None:
+    """Write the site config, test it, and restore the previous file on error."""
+    previous = SITE_PATH.read_bytes() if SITE_PATH.exists() else None
+    had_link = site_enabled()
+    SITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SITE_LINK.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(SITE_PATH, content, 0o644)
+    if not had_link:
+        try:
+            SITE_LINK.symlink_to(SITE_PATH)
+        except FileExistsError:
+            pass
+    ok, detail = nginx_test()
+    if not ok:
+        if previous is not None:
+            atomic_write(SITE_PATH, previous.decode("utf-8", "replace"), 0o644)
+        else:
+            try:
+                SITE_PATH.unlink()
+            except OSError:
+                pass
+        if not had_link:
+            try:
+                SITE_LINK.unlink()
+            except OSError:
+                pass
+        raise ProxyError("nginx rejected the generated configuration", detail)
+    nginx_start_or_reload()
+
+
+def issue_cert(settings: dict, force: bool) -> None:
+    WEBROOT.mkdir(parents=True, exist_ok=True)
+    name = cert_name(settings)
+    cmd = [
+        "certbot",
+        "certonly",
+        "--webroot",
+        "-w",
+        str(WEBROOT),
+        "--cert-name",
+        name,
+        "--non-interactive",
+        "--agree-tos",
+    ]
+    if settings.get("email"):
+        cmd += ["--email", settings["email"]]
+    else:
+        cmd += ["--register-unsafely-without-email"]
+    if settings.get("staging"):
+        cmd += ["--staging"]
+    if force:
+        cmd += ["--force-renewal"]
+    else:
+        cmd += ["--expand"]
+    for domain in domains_of(settings):
+        cmd += ["-d", domain]
+
+    proc = run(cmd, timeout=300)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        atomic_write(LAST_ERROR_PATH, detail[-6000:] + "\n", 0o644)
+        raise ProxyError("Let's Encrypt did not issue the certificate", detail[-4000:])
+    try:
+        LAST_ERROR_PATH.unlink()
+    except OSError:
+        pass
+
+
+def start_http(settings: dict, cert: dict) -> None:
+    tls_ready = cert.get("present") and cert_matches(cert, settings)
+    install_site(render_site(settings, cert, tls_ready))
+
+
+def apply_settings(data: dict) -> dict:
+    settings = validate_settings(data)
+    settings["enabled"] = True
+    write_settings(settings)
+
+    if not shutil.which("nginx"):
+        raise ProxyError("nginx is not installed", "run: sudo /home/oliver/B580-proxy/install.sh")
+    if not shutil.which("certbot"):
+        raise ProxyError("certbot is not installed", "run: sudo /home/oliver/B580-proxy/install.sh")
+
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    NGINX_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    WEBROOT.mkdir(parents=True, exist_ok=True)
+    keys, generated = ensure_keys()
+
+    cert = cert_state(settings)
+    # Bring nginx up on port 80 first so the HTTP-01 challenge can be served.
+    start_http(settings, cert)
+
+    needs_issue = not cert.get("present")
+    force = False
+    if cert.get("present") and not cert_matches(cert, settings):
+        needs_issue = True
+        force = True
+    if cert.get("present") and cert_matches(cert, settings) and (cert.get("days_left") or 0) < 30:
+        needs_issue = True
+    if needs_issue:
+        issue_cert(settings, force=force)
+        cert = cert_state(settings)
+        if not cert.get("present"):
+            raise ProxyError("certificate files are missing after certbot ran")
+
+    install_site(render_site(settings, cert, True))
+    result = status()
+    if generated:
+        result["keys"] = generated
+    return result
+
+
+def disable_proxy() -> dict:
+    settings = read_settings()
+    settings["enabled"] = False
+    write_settings(settings)
+    if site_enabled():
+        try:
+            SITE_LINK.unlink()
+        except OSError:
+            pass
+    proc = run(["systemctl", "disable", "--now", "nginx"], timeout=60)
+    # Stopping an already stopped nginx is not an error worth failing on.
+    if proc.returncode != 0 and nginx_active():
+        raise ProxyError("could not stop nginx", (proc.stderr or proc.stdout).strip())
+    return status()
+
+
+def set_api_key(key: str, slot: str = "primary") -> dict:
+    slot = check_slot(slot)
+    if not KEY_RE.match(key):
+        raise ProxyError(
+            "API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen"
+        )
+    keys = read_keys()
+    keys[slot] = key
+    write_keys(keys)
+    if nginx_active() and site_enabled():
+        ok, detail = nginx_test()
+        if not ok:
+            raise ProxyError("nginx rejected the configuration after the key change", detail)
+        nginx_start_or_reload()
+    return status()
+
+
+def renew(force: bool = False) -> dict:
+    settings = read_settings()
+    if not settings.get("domain"):
+        raise ProxyError("the proxy has no domain configured")
+    cmd = ["certbot", "renew", "--cert-name", cert_name(settings), "--non-interactive"]
+    if force:
+        cmd.append("--force-renewal")
+    proc = run(cmd, timeout=300)
+    detail = (proc.stderr or proc.stdout or "").strip()
+    if proc.returncode != 0:
+        atomic_write(LAST_ERROR_PATH, detail[-6000:] + "\n", 0o644)
+        raise ProxyError("certificate renewal failed", detail[-4000:])
+    try:
+        LAST_ERROR_PATH.unlink()
+    except OSError:
+        pass
+    # certbot runs the deploy hook itself; reload here too in case a hook is absent.
+    if nginx_active() and site_enabled():
+        nginx_start_or_reload()
+    return status()
+
+
+def helper_installed() -> bool:
+    return shutil.which("nginx") is not None and shutil.which("certbot") is not None
+
+
+def status() -> dict:
+    settings = read_settings()
+    keys = read_keys()
+    cert = cert_state(settings) if settings.get("domain") else {
+        "present": False,
+        "path": str(cert_dir(settings) / "fullchain.pem"),
+        "cert_name": cert_name(settings),
+        "staging": bool(settings.get("staging")),
+        "expires": None,
+        "days_left": None,
+        "domains": [],
+    }
+    active = nginx_active()
+    linked = site_enabled()
+    last_error = ""
+    try:
+        last_error = LAST_ERROR_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    config_ok = None
+    if shutil.which("nginx"):
+        config_ok, config_detail = nginx_test()
+        if config_ok:
+            config_detail = ""
+    else:
+        config_detail = "nginx is not installed"
+    timer = run(["systemctl", "is-enabled", "--quiet", "certbot.timer"], timeout=10).returncode == 0
+    cert_ready = bool(
+        cert.get("present")
+        and cert_matches(cert, settings)
+        and (cert.get("days_left") is None or cert.get("days_left") > 0)
+    )
+    return {
+        "ok": True,
+        "installed": helper_installed(),
+        "helper": "/usr/local/libexec/b580-proxy",
+        "nginx_installed": bool(shutil.which("nginx")),
+        "certbot_installed": bool(shutil.which("certbot")),
+        "configured": bool(settings.get("enabled") and settings.get("domain")),
+        "enabled": bool(settings.get("enabled") and settings.get("domain") and linked and active and cert_ready),
+        "nginx_active": active,
+        "site_linked": linked,
+        "config_valid": config_ok,
+        "config_detail": config_detail if config_ok is False else "",
+        "domain": settings.get("domain") or "",
+        "domain2": settings.get("domain2") or "",
+        "domains": domains_of(settings) if settings.get("domain") else [],
+        "port": settings.get("port"),
+        "port2": settings.get("port2"),
+        "backend": BACKEND_PRIMARY,
+        "backend2": BACKEND_SECONDARY,
+        "email": settings.get("email") or "",
+        "staging": bool(settings.get("staging")),
+        "api_keys": {slot: key_info(keys[slot]) for slot in SLOTS},
+        "api_key_set": bool(keys["primary"]),
+        "api_key_hint": key_hint(keys["primary"]),
+        "api_key_fingerprint": key_fingerprint(keys["primary"]),
+        "api_key2_set": bool(keys["secondary"]),
+        "api_key2_hint": key_hint(keys["secondary"]),
+        "api_key2_fingerprint": key_fingerprint(keys["secondary"]),
+        "cert": cert,
+        "renewal_timer": timer,
+        "last_error": last_error,
+        "updated": time.time(),
+    }
+
+
+def print_result(result: dict, as_json: bool) -> None:
+    if as_json:
+        json.dump(result, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+        return
+    if result.get("keys"):
+        for slot, key in result["keys"].items():
+            print(f"{slot} API key: {key}")
+        print("Store these keys now; they will not be shown again.", file=sys.stderr)
+        return
+    if "key" in result:
+        print(result["key"])
+        print("Store this key now; it will not be shown again.", file=sys.stderr)
+        return
+    if not result.get("ok", True):
+        print(f"error: {result.get('error', 'unknown error')}", file=sys.stderr)
+        if result.get("detail"):
+            print(result["detail"], file=sys.stderr)
+        return
+    state = "enabled" if result.get("enabled") else "disabled"
+    print(f"b580-proxy: {state}")
+    if result.get("domains"):
+        print(f"  domains: {', '.join(result['domains'])}")
+        print(f"  ports:   {result.get('port')} -> 127.0.0.1:{result.get('backend')}")
+        print(f"           {result.get('port2')} -> 127.0.0.1:{result.get('backend2')}")
+    print(f"  nginx:   {'active' if result.get('nginx_active') else 'inactive'}")
+    cert = result.get("cert") or {}
+    if cert.get("present"):
+        print(f"  cert:    expires in {cert.get('days_left')} days ({cert.get('expires')})")
+    else:
+        print("  cert:    not issued")
+    if result.get("api_keys"):
+        for slot, info in result["api_keys"].items():
+            if info.get("set"):
+                print(f"  {slot} key: {info.get('hint')} ({info.get('fingerprint')})")
+    elif result.get("api_key_hint"):
+        print(f"  API key: {result['api_key_hint']}")
+    if result.get("last_error"):
+        print("  last error:", file=sys.stderr)
+        print(result["last_error"], file=sys.stderr)
+
+
+def command_render(args: argparse.Namespace) -> None:
+    settings = validate_settings(
+        {
+            "domain": args.domain,
+            "domain2": args.domain2 or "",
+            "port": args.port,
+            "port2": args.port2,
+            "email": args.email or "",
+            "staging": args.staging,
+        }
+    )
+    cert = {
+        "present": not args.http_only,
+        "path": str(cert_dir(settings) / "fullchain.pem"),
+        "domains": domains_of(settings),
+        "days_left": 90,
+        "expires": now().isoformat(),
+        "staging": bool(args.staging),
+        "cert_name": cert_name(settings),
+    }
+    sys.stdout.write(render_site(settings, cert, not args.http_only))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="nginx + Let's Encrypt helper for B580 AI")
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    sub = parser.add_subparsers(dest="command")
+
+    def apply_args(p):
+        p.add_argument("--domain", required=True)
+        p.add_argument("--domain2", default="")
+        p.add_argument("--port", type=int, default=443)
+        p.add_argument("--port2", type=int, default=8443)
+        p.add_argument("--email", default="")
+        p.add_argument("--staging", action="store_true")
+        p.add_argument("--no-staging", dest="staging", action="store_false")
+        p.set_defaults(staging=False)
+
+    p_apply = sub.add_parser("apply", help="write config and obtain/renew the certificate")
+    apply_args(p_apply)
+    p_enable = sub.add_parser("enable", help="apply the saved settings")
+    p_disable = sub.add_parser("disable", help="stop nginx and disable the proxy")
+    sub.add_parser("status", help="show proxy, certificate and API-key state")
+    p_key = sub.add_parser("set-key", help="set an API key (reads stdin, or prompts)")
+    p_key.add_argument("--stdin", action="store_true", help="read the key from stdin")
+    p_key.add_argument("--slot", choices=SLOTS, default="primary", help="which server key to set")
+    p_rotate = sub.add_parser("rotate-key", help="generate and install a new API key")
+    p_rotate.add_argument("--slot", choices=SLOTS, default="primary", help="which server key to replace")
+    p_renew = sub.add_parser("renew", help="run certbot renew")
+    p_renew.add_argument("--force", action="store_true", help="force renewal")
+    p_render = sub.add_parser("render", help="print the generated nginx config (testing)")
+    apply_args(p_render)
+    p_render.add_argument("--http-only", action="store_true")
+    sub.add_parser("logs", help="show nginx service and error logs")
+    p_uninstall = sub.add_parser("uninstall", help="disable the proxy and remove generated config")
+
+    args = parser.parse_args(argv)
+    as_json = bool(getattr(args, "json", False))
+    command = args.command or "status"
+
+    try:
+        if command == "apply":
+            result = apply_settings(
+                {
+                    "domain": args.domain,
+                    "domain2": args.domain2,
+                    "port": args.port,
+                    "port2": args.port2,
+                    "email": args.email,
+                    "staging": args.staging,
+                    "enabled": True,
+                }
+            )
+        elif command == "enable":
+            saved = read_settings()
+            if not saved.get("domain"):
+                raise ProxyError("no domain is saved yet", "run apply --domain ... first")
+            result = apply_settings(saved)
+        elif command == "disable":
+            result = disable_proxy()
+        elif command == "status":
+            result = status()
+        elif command == "set-key":
+            if args.stdin:
+                key = sys.stdin.readline().strip()
+            else:
+                import getpass
+
+                key = getpass.getpass("New API key: ").strip()
+                again = getpass.getpass("Repeat API key: ").strip()
+                if key != again:
+                    raise ProxyError("the two keys do not match")
+            if not KEY_RE.match(key):
+                raise ProxyError("API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen")
+            slot = check_slot(args.slot)
+            result = set_api_key(key, slot)
+            result["key"] = key
+            result["keys"] = {slot: key}
+        elif command == "rotate-key":
+            slot = check_slot(args.slot)
+            key = generate_key()
+            try:
+                result = set_api_key(key, slot)
+            except ProxyError:
+                # The key file is written before nginx reloads/status; report the
+                # key anyway so a reload failure cannot lose it.
+                result = {
+                    "ok": True,
+                    "api_keys": {slot: key_info(key)},
+                }
+                if slot == "primary":
+                    result.update({
+                        "api_key_set": True,
+                        "api_key_hint": key_hint(key),
+                        "api_key_fingerprint": key_fingerprint(key),
+                    })
+                else:
+                    result.update({
+                        "api_key2_set": True,
+                        "api_key2_hint": key_hint(key),
+                        "api_key2_fingerprint": key_fingerprint(key),
+                    })
+            result["key"] = key
+            result["keys"] = {slot: key}
+        elif command == "renew":
+            result = renew(force=args.force)
+        elif command == "render":
+            command_render(args)
+            return 0
+        elif command == "logs":
+            proc = run(["journalctl", "-u", "nginx", "-n", "80", "--no-pager"], timeout=20)
+            sys.stdout.write(proc.stdout)
+            for path in (Path("/var/log/nginx/b580-proxy.error.log"), Path("/var/log/nginx/error.log")):
+                if path.is_file():
+                    print(f"\n== {path} ==")
+                    proc = run(["tail", "-n", "80", str(path)], timeout=10)
+                    sys.stdout.write(proc.stdout)
+            return 0
+        elif command == "uninstall":
+            settings = read_settings()
+            settings["enabled"] = False
+            write_settings(settings)
+            run(["systemctl", "disable", "--now", "nginx"], timeout=60)
+            for path in (SITE_LINK, SITE_PATH, KEY_CONF_PATH, KEY_CONF_SECONDARY):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            print("b580-proxy config removed; nginx was stopped. Certificates under /etc/letsencrypt were kept.")
+            return 0
+        else:
+            parser.error(f"unknown command {command!r}")
+            return 2
+    except ProxyError as exc:
+        print_result({"ok": False, "error": exc.message, "detail": exc.detail}, as_json)
+        return 1
+
+    print_result(result, as_json)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

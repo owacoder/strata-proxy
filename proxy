@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# User-facing wrapper for the privileged b580-proxy helper.
+#
+#   b580-proxy status
+#   b580-proxy apply --domain b580.example.com --email you@example.com
+#   b580-proxy disable
+#   b580-proxy rotate-key
+#
+# The helper checks the argument it receives; only this exact program is
+# allowed through sudo (see /etc/sudoers.d/b580-proxy).
+set -euo pipefail
+
+HELPER=/usr/local/libexec/b580-proxy
+
+if [[ ! -x "$HELPER" ]]; then
+  echo "b580-proxy is not installed yet. Run: sudo /home/oliver/B580-proxy/install.sh" >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  exec "$HELPER" "$@"
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+  echo "b580-proxy needs root: run it as root or install sudo." >&2
+  exit 1
+fi
+
+exec sudo -n "$HELPER" "$@"
