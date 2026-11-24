@@ -147,6 +147,38 @@ cd /home/oliver/B580-ai
 
 `B580-ai/proxy` is only a convenience wrapper around `b580-proxy`.
 
+### OpenCode client
+
+OpenCode sends its credential as `Authorization: Bearer <key>`.  The option is
+called `apiKey` (camel case), and in V2 it belongs under `settings`:
+
+```jsonc title="opencode.jsonc"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "b580/qwen3.8-flash-next-iq3_s",
+  "providers": {
+    "b580": {
+      "name": "B580 GPU 1",
+      "env": ["B580_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://owacoder.com:443/v1"
+      },
+      "models": {
+        "qwen3.8-flash-next-iq3_s": {
+          "name": "Qwen3.8 Flash Next IQ3_S"
+        }
+      }
+    }
+  }
+}
+```
+
+Set `B580_API_KEY` to the **primary** key for port 443 (or the **secondary**
+key and `https://owacoder.com:8443/v1` for GPU 2).  `api_key` is not a valid
+option name; using it makes OpenCode send no credential and the proxy returns
+`{"error":"API key required"}`.
+
 ---
 
 ## Certificates and renewal
@@ -228,6 +260,7 @@ Nginx configs are generated; edit the panel or use `apply`, not the config file.
 | --- | --- |
 | `Save & enable` says certbot failed | DNS A/AAAA points here, router forwards TCP 80, `curl http://<domain>/.well-known/acme-challenge/test` reaches nginx. See `/etc/b580-proxy/last-error`. |
 | `502 Bad Gateway` with a valid key | The matching Strata service is not listening on 8080/8081. Start it in the B580-ai panel. |
+| `403 Forbidden` from Strata with `Host '…' is not allowed` | The dashboard domain is missing from the model's `allowed_hosts`. Press **Save & enable** again, then restart the Strata services so the regenerated config is loaded. |
 | `401` for a request that has a key | Use the key for that port. Header must be `X-API-Key: <key>` or `Authorization: Bearer <key>`. Rotate that slot if it was lost. |
 | Browser dashboard fails through the proxy | Expected: public access requires a header. Use `http://localhost:8080/` or `:8081/` locally. |
 | `nginx -t` fails | Read `/etc/b580-proxy/last-error`, `b580-proxy logs`, and `journalctl -u nginx`. |
