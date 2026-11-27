@@ -11,22 +11,22 @@ Internet
 ```
 
 One domain can serve both ports, or a second domain can be used for the second
-port.  **Each port has its own API key**, so the two Strata servers can be
-exposed to different clients:
+port.  **One API key works on both ports**, whichever model is running:
 
 ```sh
-# GPU 1 / port 443 - primary key
-curl -H 'X-API-Key: <primary-key>' https://b580.example.com:443/v1/models
+curl -H 'X-API-Key: <api-key>' https://b580.example.com:443/v1/models
 # ...or:
-curl -H 'Authorization: Bearer <primary-key>' https://b580.example.com:443/v1/models
-
-# GPU 2 / port 8443 - secondary key
-curl -H 'X-API-Key: <secondary-key>' https://b580.example.com:8443/v1/models
+curl -H 'Authorization: Bearer <api-key>' https://b580.example.com:8443/v1/models
 ```
 
-A key only works on its own port.  Missing or wrong keys get `401` with
-`WWW-Authenticate: Bearer`.  Keys are never forwarded to Strata, and the proxy
-logs do not contain headers.
+Missing or wrong keys get `401` with `WWW-Authenticate: Bearer`.  The key is
+never forwarded to Strata, and the proxy logs do not contain headers.
+
+When only one server is running — single-GPU or layer-split mode — the B580-ai
+panel relays internal `127.0.0.1:8081` to `127.0.0.1:8080`.  nginx itself uses
+fixed backends, so port 8443 still reaches the one running model with the same
+key.  Starting GPU 2 frees 8081 for its real Strata server and the relay steps
+aside.
 
 The panel's **Open dashboard** links stay local (`8080` / `8081`) because a
 browser cannot attach an API-key header.  The public ports are for API clients.
@@ -85,11 +85,11 @@ Open <http://localhost:9090> and use the **Public access** section:
    second name to use it for port 8443.
 3. Set the two public ports (defaults 443 and 8443).
 4. Press **Save & enable**.
-5. Under **API keys**, use **Generate new key** for GPU 1 and GPU 2 and store
-   each value.  They are shown once; only the last four characters and a
-   fingerprint are displayed later.  If no keys exist yet, the first
-   **Save & enable** generates both and shows them.  Existing single-key
-   installs keep that key on both ports until you rotate one of them.
+5. Under **API key**, use **Generate new key** and store the value.  It is
+   shown once; only the last four characters and a fingerprint are displayed
+   later.  If no key exists yet, the first **Save & enable** generates one.
+   If an older install has two keys, the old primary key is kept and the
+   secondary one is discarded.
 6. Press **Disable** to stop nginx and free the ports; enable it again with
    **Save & enable**.
 
@@ -127,10 +127,8 @@ b580-proxy apply --domain b580.example.com --email you@example.com
 b580-proxy apply --domain b580.example.com --domain2 gpu2.example.com \
                  --port 443 --port2 8443 --email you@example.com
 b580-proxy disable
-b580-proxy rotate-key              # primary key (port 443) by default
-b580-proxy rotate-key --slot secondary
-b580-proxy set-key                 # prompt for a custom primary key
-b580-proxy set-key --slot secondary # prompt for a custom secondary key
+b580-proxy rotate-key              # new key for both ports
+b580-proxy set-key                 # prompt for a custom key for both ports
 b580-proxy renew                   # run certbot renew now
 b580-proxy renew --force           # force a new certificate (rate limits!)
 b580-proxy logs
@@ -174,9 +172,10 @@ called `apiKey` (camel case), and in V2 it belongs under `settings`:
 }
 ```
 
-Set `B580_API_KEY` to the **primary** key for port 443 (or the **secondary**
-key and `https://owacoder.com:8443/v1` for GPU 2).  `api_key` is not a valid
-option name; using it makes OpenCode send no credential and the proxy returns
+Set `B580_API_KEY` to the proxy API key.  The same key works on
+`https://owacoder.com:443/v1` and `https://owacoder.com:8443/v1`; point
+`baseURL` at whichever port you want to use.  `api_key` is not a valid option
+name; using it makes OpenCode send no credential and the proxy returns
 `{"error":"API key required"}`.
 
 ---
@@ -238,11 +237,10 @@ sudo apt remove nginx certbot        # optional
 | Path | Purpose |
 | --- | --- |
 | `/etc/b580-proxy/settings.json` | Last applied domains, ports, email, staging |
-| `/etc/b580-proxy/api-keys.json` | Both API keys (0600 root) |
-| `/etc/b580-proxy/api.key` | Legacy mirror of the primary key (0600 root) |
+| `/etc/b580-proxy/api-keys.json` | The one API key (0600 root) |
+| `/etc/b580-proxy/api.key` | Legacy mirror of that key (0600 root) |
 | `/etc/b580-proxy/last-error` | Last certbot error, shown in the panel |
-| `/etc/nginx/b580-proxy/api-key.conf` | Primary server auth snippet |
-| `/etc/nginx/b580-proxy/api-key-secondary.conf` | Secondary server auth snippet |
+| `/etc/nginx/b580-proxy/api-key.conf` | Auth snippet included by both HTTPS servers |
 | `/etc/nginx/sites-available/b580-proxy.conf` | Generated site config |
 | `/etc/nginx/sites-enabled/b580-proxy.conf` | Symlink, removed by `disable` |
 | `/var/www/b580-proxy` | ACME HTTP-01 webroot |
@@ -259,9 +257,9 @@ Nginx configs are generated; edit the panel or use `apply`, not the config file.
 | Symptom | Check |
 | --- | --- |
 | `Save & enable` says certbot failed | DNS A/AAAA points here, router forwards TCP 80, `curl http://<domain>/.well-known/acme-challenge/test` reaches nginx. See `/etc/b580-proxy/last-error`. |
-| `502 Bad Gateway` with a valid key | The matching Strata service is not listening on 8080/8081. Start it in the B580-ai panel. |
+| `502 Bad Gateway` with a valid key | For port 443, no Strata service is listening on 8080. For port 8443, 8081 is not listening — start GPU 2, or start the single/split model with the B580-ai panel (its internal relay covers 8081). |
 | `403 Forbidden` from Strata with `Host '…' is not allowed` | The dashboard domain is missing from the model's `allowed_hosts`. Press **Save & enable** again, then restart the Strata services so the regenerated config is loaded. |
-| `401` for a request that has a key | Use the key for that port. Header must be `X-API-Key: <key>` or `Authorization: Bearer <key>`. Rotate that slot if it was lost. |
+| `401` for a request that has a key | Use the proxy key. Header must be `X-API-Key: <key>` or `Authorization: Bearer <key>`. Rotate it in the panel if it was lost; the new key works on both ports. |
 | Browser dashboard fails through the proxy | Expected: public access requires a header. Use `http://localhost:8080/` or `:8081/` locally. |
 | `nginx -t` fails | Read `/etc/b580-proxy/last-error`, `b580-proxy logs`, and `journalctl -u nginx`. |
 | `could not build map_hash, you should increase map_hash_bucket_size: 64` | An older helper embedded the API key in an nginx map regex. Re-run `sudo /home/oliver/B580-proxy/install.sh` to install the fixed helper, then press **Save & enable** again. The fix uses short map keys and exact string checks, so it also works with 128-character keys. |

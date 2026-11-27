@@ -11,8 +11,13 @@ Two public HTTPS ports are exposed:
     primary port   -> http://127.0.0.1:8080
     secondary port -> http://127.0.0.1:8081
 
-Every request (except the ACME HTTP-01 challenge) must carry the API key,
-either as ``X-API-Key: <key>`` or ``Authorization: Bearer <key>``.
+When GPU 2's server is stopped (single-GPU or layer-split mode), the secondary
+port falls back to 127.0.0.1:8080 so the one running server stays reachable on
+both ports.  nginx prefers 8081 again as soon as it accepts connections.
+
+One API key works on both ports.  Every request (except the ACME HTTP-01
+challenge) must carry it, either as ``X-API-Key: <key>`` or
+``Authorization: Bearer <key>``.
 """
 
 from __future__ import annotations
@@ -39,8 +44,8 @@ KEY_PATH = CONF_DIR / "api.key"  # legacy single-key file, mirrored for rollback
 LAST_ERROR_PATH = CONF_DIR / "last-error"
 
 NGINX_CONF_DIR = Path("/etc/nginx/b580-proxy")
-KEY_CONF_PATH = NGINX_CONF_DIR / "api-key.conf"  # primary server
-KEY_CONF_SECONDARY = NGINX_CONF_DIR / "api-key-secondary.conf"
+KEY_CONF_PATH = NGINX_CONF_DIR / "api-key.conf"  # included by both servers
+LEGACY_KEY_CONF_SECONDARY = NGINX_CONF_DIR / "api-key-secondary.conf"
 SITE_PATH = Path("/etc/nginx/sites-available/b580-proxy.conf")
 SITE_LINK = Path("/etc/nginx/sites-enabled/b580-proxy.conf")
 WEBROOT = Path("/var/www/b580-proxy")
@@ -49,7 +54,7 @@ DEPLOY_HOOK = Path("/etc/letsencrypt/renewal-hooks/deploy/b580-proxy-reload")
 
 BACKEND_PRIMARY = 8080
 BACKEND_SECONDARY = 8081
-SLOTS = ("primary", "secondary")
+KEY_SLOT = "primary"
 
 DEFAULT_SETTINGS = {
     "enabled": False,
@@ -191,7 +196,7 @@ def generate_key() -> str:
 
 
 def read_key() -> str:
-    """Read the legacy single-key file (used when migrating to two slots)."""
+    """Read the legacy single-key file, used when migrating older installs."""
     try:
         return KEY_PATH.read_text(encoding="utf-8").strip()
     except OSError:
@@ -216,84 +221,73 @@ def key_info(key: str) -> dict:
     }
 
 
-def check_slot(slot: str) -> str:
-    slot = str(slot or "primary").strip().lower()
-    if slot not in SLOTS:
-        raise ProxyError(f"unknown API key slot: {slot!r}", "use primary or secondary")
-    return slot
+def read_key_value() -> str:
+    """Load the one API key, migrating older two-key installs.
 
-
-def read_keys() -> dict:
-    """Load both keys, migrating a legacy single key to both slots if needed.
-
-    Existing installs keep working: the old key is copied to the primary slot
-    and to the secondary slot.  A fresh install with no key generates nothing
-    here; ensure_keys() does that when the proxy is first enabled.
+    If both keys exist, the primary one is kept.  If only a secondary key
+    existed, it becomes the key so existing clients keep working.  A fresh
+    install with no key generates nothing here; ensure_keys() does that when
+    the proxy is first enabled.
     """
-    keys = {slot: "" for slot in SLOTS}
+    key = ""
     changed = False
     try:
         raw = json.loads(KEYS_PATH.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            for slot in SLOTS:
-                value = str(raw.get(slot) or "").strip()
-                if KEY_RE.match(value):
-                    keys[slot] = value
-                elif value:
-                    changed = True
+            candidate = str(raw.get(KEY_SLOT) or raw.get("key") or "").strip()
+            secondary = str(raw.get("secondary") or "").strip()
+            if KEY_RE.match(candidate):
+                key = candidate
+            elif candidate:
+                changed = True
+            if not key and KEY_RE.match(secondary):
+                key = secondary
+            if "secondary" in raw:
+                changed = True
     except FileNotFoundError:
         changed = True
     except (OSError, ValueError):
         changed = True
 
-    legacy = read_key()
-    if not keys["primary"] and not keys["secondary"] and KEY_RE.match(legacy):
-        keys = {"primary": legacy, "secondary": legacy}
-        changed = True
-    if not keys["primary"] and keys["secondary"]:
-        keys["primary"] = keys["secondary"]
-        changed = True
-    if not keys["secondary"] and keys["primary"]:
-        keys["secondary"] = keys["primary"]
-        changed = True
+    if not key:
+        legacy = read_key()
+        if KEY_RE.match(legacy):
+            key = legacy
+            changed = True
 
-    if changed and keys["primary"] and keys["secondary"]:
-        write_keys(keys)
-    return keys
+    if changed and key:
+        write_keys(key)
+    return key
 
 
-def ensure_keys() -> tuple[dict, dict]:
-    """Return both keys, generating any missing ones.  Generated keys are returned once."""
-    keys = read_keys()
-    generated: dict[str, str] = {}
-    for slot in SLOTS:
-        if not keys[slot]:
-            keys[slot] = generate_key()
-            generated[slot] = keys[slot]
-    if generated:
-        write_keys(keys)
-    return keys, generated
+def ensure_keys() -> tuple[str, str]:
+    """Return the API key, generating one if missing.  A new key is returned once."""
+    key = read_key_value()
+    generated = ""
+    if not key:
+        key = generate_key()
+        generated = key
+        write_keys(key)
+    return key, generated
 
 
-def write_keys(keys: dict) -> None:
-    for slot in SLOTS:
-        if not KEY_RE.match(str(keys.get(slot) or "")):
-            raise ProxyError(
-                f"{slot} API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen"
-            )
+def write_keys(key: str) -> None:
+    if not KEY_RE.match(key):
+        raise ProxyError(
+            "API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen"
+        )
     atomic_write(
         KEYS_PATH,
-        json.dumps({slot: keys[slot] for slot in SLOTS}, indent=2) + "\n",
+        json.dumps({KEY_SLOT: key}, indent=2) + "\n",
         0o600,
     )
-    # Keep the legacy file in sync with the primary key for easy rollback.
-    atomic_write(KEY_PATH, keys["primary"] + "\n", 0o600)
-    write_key_conf(keys["primary"], KEY_CONF_PATH)
-    write_key_conf(keys["secondary"], KEY_CONF_SECONDARY)
+    # Keep the legacy file in sync for easy rollback.
+    atomic_write(KEY_PATH, key + "\n", 0o600)
+    write_key_conf(key, KEY_CONF_PATH)
 
 
 def write_key_conf(key: str, path: Path) -> None:
-    # This file is included inside one HTTPS server block.  Exact string
+    # This file is included by both HTTPS server blocks.  Exact string
     # comparisons avoid long nginx map keys; a 48-character generated key in a
     # map regex exceeded nginx's default map_hash_bucket_size (64).
     conf = f"""# Generated by b580-proxy - do not edit.
@@ -427,7 +421,7 @@ def https_server(
     settings: dict,
     domain: str,
     port: int,
-    backend: int,
+    backend: str,
     label: str,
     cert: dict,
     key_conf: Path,
@@ -469,7 +463,7 @@ def https_server(
         if ($b580_key_ok = 0) {{
             return 401;
         }}
-        proxy_pass http://127.0.0.1:{backend};
+        proxy_pass http://{backend};
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -507,12 +501,14 @@ def render_site(settings: dict, cert: dict, tls_ready: bool) -> str:
         http_server(settings, tls_ready),
     ]
     if tls_ready:
+        # The panel relays 8081 to 8080 while GPU 2 is stopped, so nginx only
+        # needs one fixed backend per port.
         parts.append(
             https_server(
                 settings,
                 settings["domain"],
                 settings["port"],
-                BACKEND_PRIMARY,
+                f"127.0.0.1:{BACKEND_PRIMARY}",
                 "one",
                 cert,
                 KEY_CONF_PATH,
@@ -523,10 +519,10 @@ def render_site(settings: dict, cert: dict, tls_ready: bool) -> str:
                 settings,
                 settings.get("domain2") or settings["domain"],
                 settings["port2"],
-                BACKEND_SECONDARY,
+                f"127.0.0.1:{BACKEND_SECONDARY}",
                 "two",
                 cert,
-                KEY_CONF_SECONDARY,
+                KEY_CONF_PATH,
             )
         )
     return "".join(parts)
@@ -638,9 +634,15 @@ def apply_settings(data: dict) -> dict:
             raise ProxyError("certificate files are missing after certbot ran")
 
     install_site(render_site(settings, cert, True))
+    # Older installs had a separate key snippet for port 8443.  The new config
+    # no longer includes it, so remove the stale file after a successful reload.
+    try:
+        LEGACY_KEY_CONF_SECONDARY.unlink()
+    except OSError:
+        pass
     result = status()
     if generated:
-        result["keys"] = generated
+        result["keys"] = {KEY_SLOT: generated}
     return result
 
 
@@ -660,15 +662,12 @@ def disable_proxy() -> dict:
     return status()
 
 
-def set_api_key(key: str, slot: str = "primary") -> dict:
-    slot = check_slot(slot)
+def set_api_key(key: str) -> dict:
     if not KEY_RE.match(key):
         raise ProxyError(
             "API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen"
         )
-    keys = read_keys()
-    keys[slot] = key
-    write_keys(keys)
+    write_keys(key)
     if nginx_active() and site_enabled():
         ok, detail = nginx_test()
         if not ok:
@@ -705,7 +704,7 @@ def helper_installed() -> bool:
 
 def status() -> dict:
     settings = read_settings()
-    keys = read_keys()
+    key = read_key_value()
     cert = cert_state(settings) if settings.get("domain") else {
         "present": False,
         "path": str(cert_dir(settings) / "fullchain.pem"),
@@ -756,13 +755,10 @@ def status() -> dict:
         "backend2": BACKEND_SECONDARY,
         "email": settings.get("email") or "",
         "staging": bool(settings.get("staging")),
-        "api_keys": {slot: key_info(keys[slot]) for slot in SLOTS},
-        "api_key_set": bool(keys["primary"]),
-        "api_key_hint": key_hint(keys["primary"]),
-        "api_key_fingerprint": key_fingerprint(keys["primary"]),
-        "api_key2_set": bool(keys["secondary"]),
-        "api_key2_hint": key_hint(keys["secondary"]),
-        "api_key2_fingerprint": key_fingerprint(keys["secondary"]),
+        "api_keys": {KEY_SLOT: key_info(key)},
+        "api_key_set": bool(key),
+        "api_key_hint": key_hint(key),
+        "api_key_fingerprint": key_fingerprint(key),
         "cert": cert,
         "renewal_timer": timer,
         "last_error": last_error,
@@ -857,9 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="show proxy, certificate and API-key state")
     p_key = sub.add_parser("set-key", help="set an API key (reads stdin, or prompts)")
     p_key.add_argument("--stdin", action="store_true", help="read the key from stdin")
-    p_key.add_argument("--slot", choices=SLOTS, default="primary", help="which server key to set")
     p_rotate = sub.add_parser("rotate-key", help="generate and install a new API key")
-    p_rotate.add_argument("--slot", choices=SLOTS, default="primary", help="which server key to replace")
     p_renew = sub.add_parser("renew", help="run certbot renew")
     p_renew.add_argument("--force", action="store_true", help="force renewal")
     p_render = sub.add_parser("render", help="print the generated nginx config (testing)")
@@ -906,36 +900,25 @@ def main(argv: list[str] | None = None) -> int:
                     raise ProxyError("the two keys do not match")
             if not KEY_RE.match(key):
                 raise ProxyError("API key must be 16-128 characters of A-Z, a-z, 0-9, dot, underscore, tilde or hyphen")
-            slot = check_slot(args.slot)
-            result = set_api_key(key, slot)
+            result = set_api_key(key)
             result["key"] = key
-            result["keys"] = {slot: key}
+            result["keys"] = {KEY_SLOT: key}
         elif command == "rotate-key":
-            slot = check_slot(args.slot)
             key = generate_key()
             try:
-                result = set_api_key(key, slot)
+                result = set_api_key(key)
             except ProxyError:
                 # The key file is written before nginx reloads/status; report the
                 # key anyway so a reload failure cannot lose it.
                 result = {
                     "ok": True,
-                    "api_keys": {slot: key_info(key)},
+                    "api_keys": {KEY_SLOT: key_info(key)},
+                    "api_key_set": True,
+                    "api_key_hint": key_hint(key),
+                    "api_key_fingerprint": key_fingerprint(key),
                 }
-                if slot == "primary":
-                    result.update({
-                        "api_key_set": True,
-                        "api_key_hint": key_hint(key),
-                        "api_key_fingerprint": key_fingerprint(key),
-                    })
-                else:
-                    result.update({
-                        "api_key2_set": True,
-                        "api_key2_hint": key_hint(key),
-                        "api_key2_fingerprint": key_fingerprint(key),
-                    })
             result["key"] = key
-            result["keys"] = {slot: key}
+            result["keys"] = {KEY_SLOT: key}
         elif command == "renew":
             result = renew(force=args.force)
         elif command == "render":
@@ -955,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
             settings["enabled"] = False
             write_settings(settings)
             run(["systemctl", "disable", "--now", "nginx"], timeout=60)
-            for path in (SITE_LINK, SITE_PATH, KEY_CONF_PATH, KEY_CONF_SECONDARY):
+            for path in (SITE_LINK, SITE_PATH, KEY_CONF_PATH, LEGACY_KEY_CONF_SECONDARY):
                 try:
                     path.unlink()
                 except OSError:
